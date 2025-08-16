@@ -1,4 +1,5 @@
-Directory to contain results for this project:
+Directory containing key figures and results:
 
-- `/results/csv`: dataframes
-- `/results/plots`: plots
+- `/overview_figures`: overview figures used in the manuscript
+- `/exeriment_1`: plots for experiment 1
+- `/exeriment_2`: plots for experiment 2
