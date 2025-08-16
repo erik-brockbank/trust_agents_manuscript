@@ -1,3 +1,5 @@
+# DATA
+
 This directory contains participant data used in the reported results.
 
 - `/experiment_1`: experiment 1 participant data
