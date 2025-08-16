@@ -163,6 +163,45 @@ nonsocial_data = nonsocial_data |>
 glimpse(nonsocial_data)
 
 
+# DATA PROCESSING ----
+
+# Remove anybody that didn't complete 96 trials
+incomplete_ids = trial_data |>
+  group_by(gameID) |>
+  summarize(
+    complete_trials = n()
+  ) |>
+  ungroup() |>
+  filter(
+    complete_trials < 96 # TODO store this as a global?
+  ) |>
+  arrange(complete_trials)
+incomplete_ids
+
+trial_data = trial_data |>
+  filter(
+    !gameID %in% unique(incomplete_ids$gameID)
+  )
+
+incomplete_ids_nonsocial = nonsocial_data |>
+  group_by(gameID) |>
+  summarize(
+    complete_trials = n()
+  ) |>
+  ungroup() |>
+  filter(
+    complete_trials < 96 # TODO store this as a global?
+  ) |>
+  arrange(complete_trials)
+incomplete_ids_nonsocial
+
+nonsocial_data = nonsocial_data |>
+  filter(
+    !gameID %in% unique(incomplete_ids_nonsocial$gameID)
+  )
+
+
+
 
 
 
