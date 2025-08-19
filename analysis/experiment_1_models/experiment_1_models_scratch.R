@@ -21,6 +21,7 @@ NONSOCIAL_DATA_FILE = 'experiment_1_nonsocial/nonsocial_trialdata.csv' # name of
 
 
 # Experiment parameters
+N_TRIALS = 96
 TRIAL_BLOCKS = 8
 CONDITION_LOOKUP = c(
   'bad' = 'unreliable',
@@ -119,22 +120,21 @@ trial_data = read_csv(paste(DATA_DIR, E1_DATA_FILE, sep = '/'))
 glimpse(trial_data)
 
 # Add derived columns
-# NB: this takes 5-10s to run
 # TODO remove any columns below that aren't used in the final analyses
 trial_data = trial_data |>
   rowwise() |>
-  mutate(
-    trial_block = ceiling((trialInd + 1) / ((max(trial_data$trialInd) + 1) / TRIAL_BLOCKS)),
+  mutate( # NB: this takes 5-10s to run
+    trial_block = ceiling((trialInd + 1) / (N_TRIALS / TRIAL_BLOCKS)),
     condition_str = factor(CONDITION_LOOKUP[agent_cond], levels = CONDITION_ORDER),
     paddleIntervention = !trustedAgent,
-    final_par = get_final_angle(paddle_rho, paddle_tr),
-    intervene_dist = get_angle_difference(paddle_rho, final_par),
+    final_participant_angle = get_final_angle(paddle_rho, paddle_tr),
+    intervene_dist = get_angle_difference(paddle_rho, final_participant_angle),
     intervene_dist_degrees = rad_to_deg(intervene_dist),
     bot_error = get_angle_difference(groundtruthAngle, paddle_rho),
     bot_error_degrees = rad_to_deg(bot_error),
-    human_error = get_angle_difference(groundtruthAngle, final_par),
+    human_error = get_angle_difference(groundtruthAngle, final_participant_angle),
     human_error_degrees = rad_to_deg(human_error),
-    signed_human_error = get_signed_participant_error(paddle_rho, final_par, groundtruthAngle),
+    signed_human_error = get_signed_participant_error(paddle_rho, final_participant_angle, groundtruthAngle),
     signed_human_error_degrees = rad_to_deg(signed_human_error)
   )
 # sanity check
@@ -146,11 +146,10 @@ nonsocial_data = read_csv(paste(DATA_DIR, NONSOCIAL_DATA_FILE, sep = '/'))
 glimpse(nonsocial_data)
 
 # Add derived columns
-# NB: similar columns here but slightly different from above, not copy-paste
 nonsocial_data = nonsocial_data |>
   rowwise() |>
-  mutate(
-    trial_block = ceiling((trialInd + 1) / ((max(trial_data$trialInd) + 1) / TRIAL_BLOCKS)),
+  mutate( # NB: similar columns here but slightly different from above, not copy-paste
+    trial_block = ceiling((trialInd + 1) / (N_TRIALS / TRIAL_BLOCKS)),
     condition_str = factor(CONDITION_LOOKUP[condition], levels = CONDITION_ORDER),
     paddle_intervention = updatedPaddle,
     final_participant_angle = get_final_angle(paddle_rho, paddle_tr),
@@ -166,6 +165,8 @@ glimpse(nonsocial_data)
 # DATA PROCESSING ----
 
 # Remove anybody that didn't complete 96 trials
+
+# Summarize: incomplete subjects in trial_data
 incomplete_ids = trial_data |>
   group_by(gameID) |>
   summarize(
@@ -173,16 +174,18 @@ incomplete_ids = trial_data |>
   ) |>
   ungroup() |>
   filter(
-    complete_trials < 96 # TODO store this as a global?
+    complete_trials < N_TRIALS
   ) |>
   arrange(complete_trials)
 incomplete_ids
 
+# Remove incomplete subjects
 trial_data = trial_data |>
   filter(
     !gameID %in% unique(incomplete_ids$gameID)
   )
 
+# Summarize: incomplete subjects in nonsocial_data
 incomplete_ids_nonsocial = nonsocial_data |>
   group_by(gameID) |>
   summarize(
@@ -190,21 +193,378 @@ incomplete_ids_nonsocial = nonsocial_data |>
   ) |>
   ungroup() |>
   filter(
-    complete_trials < 96 # TODO store this as a global?
+    complete_trials < N_TRIALS
   ) |>
   arrange(complete_trials)
 incomplete_ids_nonsocial
 
+# Remove incomplete subjects
 nonsocial_data = nonsocial_data |>
   filter(
     !gameID %in% unique(incomplete_ids_nonsocial$gameID)
   )
 
 
+# Remove all trials in which people did not move the paddle
+
+# Summarize: how many trials did subjects skip?
+nonsocial_data |>
+  group_by(gameID) |>
+  summarize(
+    num_skipped = sum(!paddle_intervention),
+    num_trials = n(),
+    prop_skipped = num_skipped / num_trials
+  ) |>
+  ungroup() |>
+  arrange(desc(num_skipped)) |>
+  print(n=nrow(nonsocial_data))
+
+# Filter out trials with no paddle intervention
+nonsocial_data = nonsocial_data |>
+  filter(updatedPaddle)
 
 
+# MODEL ----
+
+DECAY_SLOPE = -1.0
+
+# > Calculate variance of bot error ----
+
+# Add squared bot error columns and initialize additional columns needed for calculating variance of bot error
+trial_data = trial_data |>
+  rowwise() |>
+  mutate(
+    prev_trials = trialInd, # since trialInd is 0-indexed, it also encodes the number of previous trials
+    # bot error colums: radians
+    bot_error_sq = bot_error^2, # squared bot error in each trial
+    prev_bot_error_sq = 0, # initialize supporting column for calculating sum of squared bot error in previous trials
+    sum_prev_bot_error_sq = 0, # initialize sum of squared bot error in previous trials
+    var_prev_bot_error = 0, # initialize variance of bot error in previous trials
+    # bot error colums: degrees
+    bot_error_degrees_sq = bot_error_degrees^2, # squared bot error (degrees) in each trial
+    prev_bot_error_degrees_sq = 0, # initialize supporting column for calculating sum of squared bot error (degrees) in previous trials
+    sum_prev_bot_error_degrees_sq = 0, # initialize sum of squared bot error (degrees) in previous trials
+    var_prev_bot_error_degrees = 0, # initialize variance of bot error (degrees) in previous trials
+    # weighted error: initial trials
+    early_sum_prev_bot_error_sq = 0, # *weighted* sum of squared bot error across previous (early) trials
+    early_var_prev_bot_error = 0, # variance of *weighted* bot error across previous (early) trials
+    early_sum_prev_bot_error_degrees_sq = 0, # *weighted* sum of squared bot error (degrees) across previous (early) trials
+    early_var_prev_bot_error_degrees = 0, # variance of *weighted* bot error (degrees) across previous (early) trials
+    # weighted error: recent trials
+    late_sum_prev_bot_error_sq = 0, # *weighted* sum of squared bot error across previous (recent) trials
+    late_var_prev_bot_error = 0, # variance of *weighted* bot error across previous (recent) trials
+    late_sum_prev_bot_error_degrees_sq = 0, # *weighted* sum of squared bot error (degrees) across previous (recent) trials
+    late_var_prev_bot_error_degrees = 0 # variance of *weighted* bot error (degrees) across previous (recent) trials
+  )
+
+# Fill in supporting columns for calculating sum of squared bot error across previous trials
+trial_data = trial_data |>
+  group_by(gameID) |>
+  arrange(gameID, trialInd) |>
+  mutate(
+    prev_bot_error_sq = ifelse(is.na(lag(bot_error_sq, 1)), 0, lag(bot_error_sq, 1)),
+    prev_bot_error_degrees_sq = ifelse(is.na(lag(bot_error_degrees_sq, 1)), 0, lag(bot_error_degrees_sq, 1))
+  )
+
+# Fill in sum of squared bot error across previous trials
+trial_data = trial_data |>  # NB: ensure that data is arranged by subject, increasing trial index
+  arrange(gameID, sort(trialInd))
+
+for (subj in unique(trial_data$gameID)) { # NB: this takes 60-120s to run
+  for (idx in sort(unique(trial_data$trialInd))) {
+    trial_data$sum_prev_bot_error_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_sq[1:(idx+1)])
+    trial_data$sum_prev_bot_error_degrees_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_degrees_sq[1:(idx+1)])
+    # Fill in *weighted* sum of squared bot error across previous (early) trials
+    trial_data$early_sum_prev_bot_error_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_sq[1:(idx+1)]*(seq(from=0, to=idx)^DECAY_SLOPE), na.rm=T)
+    trial_data$early_sum_prev_bot_error_degrees_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_degrees_sq[1:(idx+1)]*(seq(from=0, to=idx)^DECAY_SLOPE), na.rm=T)
+    # Fill in *weighted* sum of squared bot error across previous (recent) trials
+    trial_data$late_sum_prev_bot_error_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_sq[1:(idx+1)]*(rev(seq(from=1, to=idx+1)^DECAY_SLOPE)), na.rm=T)
+    trial_data$late_sum_prev_bot_error_degrees_sq[trial_data$gameID == subj & trial_data$trialInd == idx] = sum(trial_data[trial_data$gameID == subj,]$prev_bot_error_degrees_sq[1:(idx+1)]*(rev(seq(from=1, to=idx+1)^DECAY_SLOPE)), na.rm=T)
+  }
+}
+
+# Fill in variance of bot error across previous trials
+trial_data = trial_data |>
+  rowwise() |>
+  mutate(
+    var_prev_bot_error = ifelse(prev_trials < 2,
+                                NA, # NB: prev error variance is undefined over first 2 trials
+                                sum_prev_bot_error_sq / (prev_trials-1)),
+    var_prev_bot_error_degrees = ifelse(prev_trials < 2,
+                                        NA, # # NB: prev error variance is undefined over first 2 trials
+                                        sum_prev_bot_error_degrees_sq / (prev_trials-1)),
+    # Fill in *weighted* variance of bot error across previous (early) trials
+    early_var_prev_bot_error = ifelse(prev_trials < 2,
+                                      NA,
+                                      early_sum_prev_bot_error_sq / sum(seq(from=1, to=prev_trials-1)^DECAY_SLOPE)),
+    early_var_prev_bot_error_degrees = ifelse(prev_trials < 2,
+                                              NA,
+                                              early_sum_prev_bot_error_degrees_sq / sum(seq(from=1, to=prev_trials-1)^DECAY_SLOPE)),
+    # Fill in *weighted* variance of bot error across previous (early) trials
+    late_var_prev_bot_error = ifelse(prev_trials < 2,
+                                     NA,
+                                     late_sum_prev_bot_error_sq / sum(seq(from=1, to=prev_trials-1)^DECAY_SLOPE)),
+    late_var_prev_bot_error_degrees = ifelse(prev_trials < 2,
+                                             NA,
+                                             late_sum_prev_bot_error_degrees_sq / sum(seq(from=1, to=prev_trials-1)^DECAY_SLOPE))
+  )
 
 
+# sanity checks
+trial_data |>
+  filter(gameID == subj) |>
+  select(trialInd,
+         prev_bot_error_degrees_sq, sum_prev_bot_error_degrees_sq, var_prev_bot_error_degrees,
+         early_sum_prev_bot_error_degrees_sq, early_var_prev_bot_error_degrees,
+         late_sum_prev_bot_error_degrees_sq, late_var_prev_bot_error_degrees
+  ) |>
+  print(n=nrow(trial_data))
 
 
+# > Calculate variance of human error ----
+
+# Calculate squared error on each trial
+nonsocial_data = nonsocial_data |>
+  rowwise() |>
+  mutate(
+    human_error_sq = human_error^2, # squared human error in each trial
+    human_error_degrees_sq = human_error_degrees^2, # squared human error (degrees) in each trial
+  )
+
+# Calculate variance of human error on this trial index: sum of human squared error on this trial index / (number of participants-1)
+nonsocial_data_trial_ind_summary = nonsocial_data |>
+  group_by(trialInd) |>
+  summarize(
+    var_human_error_trial_idx = sum(human_error_sq) / (n()-1),
+    var_human_error_degrees_trial_idx = sum(human_error_degrees_sq) / (n()-1)
+  ) |>
+  ungroup()
+
+# Calculate average nonsocial response for each trial angle (used to generate 'internal estimate' below)
+nonsocial_data_trial_angle_summary = nonsocial_data |>
+  group_by(launching_rho, paddle_rho_original) |> # NB: paddle_rho_original is ground truth est. from simulation
+  summarize(
+    avg_nonsocial_trial_estimate = mean(final_participant_angle),
+    avg_nonsocial_trial_estimate_degrees = rad_to_deg(avg_nonsocial_trial_estimate),
+    sd_nonsocial_trial_estimate = sd(final_participant_angle), # NB: probably not necessary
+    sd_nonsocial_trial_estimate_degrees = sd(rad_to_deg(final_participant_angle))
+  ) |>
+  ungroup()
+
+
+# > Calculate variance weights ----
+
+# Combine nonsocial trial index summary above with trial data
+trial_data = trial_data |>
+  inner_join(
+    nonsocial_data_trial_ind_summary,
+    by = c('trialInd')
+  )
+
+# Combine nonsocial trial angle summary above with trial data
+trial_data = trial_data |>
+  inner_join(
+    nonsocial_data_trial_angle_summary,
+    by = c('launching_rho', 'paddle_rho_original')
+  )
+
+# Calculate weights using the columns added above
+# NB: below is redundant (human and bot weights sum to 1)
+trial_data = trial_data |>
+  rowwise() |>
+  mutate(
+    inv_var_prev_bot_error = 1 / var_prev_bot_error,
+    inv_var_prev_bot_error_degrees = 1 / var_prev_bot_error_degrees,
+    inv_var_human_error_trial_idx = 1 / var_human_error_trial_idx,
+    inv_var_human_error_degrees_trial_idx = 1 / var_human_error_degrees_trial_idx,
+    weight_participant_estimate = inv_var_human_error_trial_idx / sum(inv_var_human_error_trial_idx, inv_var_prev_bot_error),
+    weight_participant_estimate_degrees = inv_var_human_error_degrees_trial_idx / sum(inv_var_human_error_degrees_trial_idx, inv_var_prev_bot_error_degrees),
+    weight_bot_estimate = inv_var_prev_bot_error / sum(inv_var_human_error_trial_idx, inv_var_prev_bot_error),
+    weight_bot_estimate_degrees = inv_var_prev_bot_error_degrees / sum(inv_var_human_error_degrees_trial_idx, inv_var_prev_bot_error_degrees),
+    # calculate weights for *weighted* error across previous (early) trials
+    early_inv_var_prev_bot_error = 1 / early_var_prev_bot_error,
+    early_inv_var_prev_bot_error_degrees = 1 / early_var_prev_bot_error_degrees,
+    early_weight_participant_estimate = inv_var_human_error_trial_idx / sum(inv_var_human_error_trial_idx, early_inv_var_prev_bot_error),
+    early_weight_participant_estimate_degrees = inv_var_human_error_degrees_trial_idx / sum(inv_var_human_error_degrees_trial_idx, early_inv_var_prev_bot_error_degrees),
+    early_weight_bot_estimate = early_inv_var_prev_bot_error / sum(inv_var_human_error_trial_idx, early_inv_var_prev_bot_error),
+    early_weight_bot_estimate_degrees = early_inv_var_prev_bot_error_degrees / sum(inv_var_human_error_degrees_trial_idx, early_inv_var_prev_bot_error_degrees),
+    # calculate weights for *weighted* error across previous (recent) trials
+    late_inv_var_prev_bot_error = 1 / late_var_prev_bot_error,
+    late_inv_var_prev_bot_error_degrees = 1 / late_var_prev_bot_error_degrees,
+    late_weight_participant_estimate = inv_var_human_error_trial_idx / sum(inv_var_human_error_trial_idx, late_inv_var_prev_bot_error),
+    late_weight_participant_estimate_degrees = inv_var_human_error_degrees_trial_idx / sum(inv_var_human_error_degrees_trial_idx, late_inv_var_prev_bot_error_degrees),
+    late_weight_bot_estimate = late_inv_var_prev_bot_error / sum(inv_var_human_error_trial_idx, late_inv_var_prev_bot_error),
+    late_weight_bot_estimate_degrees = late_inv_var_prev_bot_error_degrees / sum(inv_var_human_error_degrees_trial_idx, late_inv_var_prev_bot_error_degrees)
+  )
+
+
+# > Calculate weighted paddle placement estimates ----
+
+# Combine agent partner estimate, participant estimate
+trial_data = trial_data |>
+  rowwise() |>
+  mutate(
+    # baseline model (weight based on variance)
+    weighted_paddle_estimate_baseline = sum((weight_participant_estimate*avg_nonsocial_trial_estimate), (weight_bot_estimate*paddle_rho)),
+    weighted_paddle_estimate_degrees_baseline = sum((weight_participant_estimate_degrees*avg_nonsocial_trial_estimate_degrees), (weight_bot_estimate_degrees*rad_to_deg(paddle_rho))),
+    # participant estimate only
+    weighted_paddle_estimate_participant = avg_nonsocial_trial_estimate,
+    weighted_paddle_estimate_degrees_participant = avg_nonsocial_trial_estimate_degrees,
+    # agent partner estimate only
+    weighted_paddle_estimate_bot = paddle_rho,
+    weighted_paddle_estimate_degrees_bot = rad_to_deg(paddle_rho),
+    # weighted paddle estimates using *weighted* error across previous (early) trials
+    weighted_paddle_estimate_early = sum((early_weight_participant_estimate*avg_nonsocial_trial_estimate), (early_weight_bot_estimate*paddle_rho)),
+    weighted_paddle_estimate_degrees_early = sum((early_weight_participant_estimate_degrees*avg_nonsocial_trial_estimate_degrees), (early_weight_bot_estimate_degrees*rad_to_deg(paddle_rho))),
+    # weighted paddle estimates using *weighted* error across previous (late) trials
+    weighted_paddle_estimate_late = sum((late_weight_participant_estimate*avg_nonsocial_trial_estimate), (late_weight_bot_estimate*paddle_rho)),
+    weighted_paddle_estimate_degrees_late = sum((late_weight_participant_estimate_degrees*avg_nonsocial_trial_estimate_degrees), (late_weight_bot_estimate_degrees*rad_to_deg(paddle_rho)))
+  )
+
+
+# > Calculate error of weighted paddle placement estimates ----
+
+trial_data = trial_data |>
+  rowwise() |>
+  mutate(
+    # baseline model (weight based on variance)
+    weighted_paddle_estimate_error_baseline = get_angle_difference(final_participant_angle, weighted_paddle_estimate_baseline),
+    weighted_paddle_estimate_error_degrees_baseline = rad_to_deg(weighted_paddle_estimate_error_baseline),
+    # participant estimate only
+    weighted_paddle_estimate_error_participant = get_angle_difference(final_participant_angle, weighted_paddle_estimate_participant),
+    weighted_paddle_estimate_error_degrees_participant = rad_to_deg(weighted_paddle_estimate_error_participant),
+    # agent partner estimate only
+    weighted_paddle_estimate_error_bot = get_angle_difference(final_participant_angle, weighted_paddle_estimate_bot),
+    weighted_paddle_estimate_error_degrees_bot = rad_to_deg(weighted_paddle_estimate_error_bot),
+    # weighted paddle estimates using *weighted* error across previous (early) trials
+    weighted_paddle_estimate_error_early = get_angle_difference(final_participant_angle, weighted_paddle_estimate_early),
+    weighted_paddle_estimate_error_degrees_early = rad_to_deg(weighted_paddle_estimate_error_early),
+    # weighted paddle estimates using *weighted* error across previous (late) trials
+    weighted_paddle_estimate_error_late = get_angle_difference(final_participant_angle, weighted_paddle_estimate_late),
+    weighted_paddle_estimate_error_degrees_late = rad_to_deg(weighted_paddle_estimate_error_late)
+  )
+
+
+# Figure: compare error across models
+trial_data |>
+  select(
+    gameID, trialInd, trial_block, condition_str,
+    weighted_paddle_estimate_error_degrees_bot,
+    weighted_paddle_estimate_error_degrees_participant,
+    weighted_paddle_estimate_error_degrees_baseline,
+    weighted_paddle_estimate_error_degrees_early,
+    weighted_paddle_estimate_error_degrees_late
+  ) |>
+  filter( # NB: these are all NA in same trials (first 2 rows for each subject)
+    !is.na(weighted_paddle_estimate_error_degrees_baseline),
+    !is.na(weighted_paddle_estimate_error_degrees_early),
+    !is.na(weighted_paddle_estimate_error_degrees_late)
+  ) |>
+  pivot_longer(
+    cols = starts_with('weighted_paddle_estimate_error'),
+    names_to = c('.value', 'model'),
+    names_pattern = 'weighted_paddle_estimate_error_(.*)_(.*)'
+  ) |>
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        'bot',
+        'participant',
+        'baseline',
+        'early',
+        'late'
+      )
+    )
+  ) |>
+  ggplot(
+    aes(x = model, y = degrees)
+  ) +
+  stat_summary(
+    fun.data = 'mean_cl_boot',
+    geom = 'pointrange'
+  ) +
+  scale_x_discrete(
+    labels = c(
+      'bot' = 'partner \nonly',
+      'participant' = 'participant \nonly',
+      'baseline' = 'cue \nintegration',
+      'early' = 'cue \nintegration \n(early trials)',
+      'late' = 'cue \nintegration \n(late trials)'
+    )
+  ) +
+  scale_y_continuous(
+    name = 'error (degrees)'
+  ) +
+  PLOT_THEME
+
+# Figure: compare error across models (separate by condition)
+trial_data |>
+  select(
+    gameID, trialInd, trial_block, condition_str,
+    weighted_paddle_estimate_error_degrees_bot,
+    weighted_paddle_estimate_error_degrees_participant,
+    weighted_paddle_estimate_error_degrees_baseline,
+    weighted_paddle_estimate_error_degrees_early,
+    weighted_paddle_estimate_error_degrees_late
+  ) |>
+  filter( # NB: these are all NA in same trials (first 2 rows for each subject)
+    !is.na(weighted_paddle_estimate_error_degrees_baseline),
+    !is.na(weighted_paddle_estimate_error_degrees_early),
+    !is.na(weighted_paddle_estimate_error_degrees_late)
+  ) |>
+  pivot_longer(
+    cols = starts_with('weighted_paddle_estimate_error'),
+    names_to = c('.value', 'model'),
+    names_pattern = 'weighted_paddle_estimate_error_(.*)_(.*)'
+  ) |>
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        'bot',
+        'participant',
+        'baseline',
+        'early',
+        'late'
+      )
+    )
+  ) |>
+  ggplot(
+    aes(x = model, y = degrees, color = condition_str, fill = condition_str)
+  ) +
+  stat_summary(
+    fun.data = 'mean_cl_boot',
+    geom = 'bar',
+    position = position_dodge(width = 0.9),
+    alpha = 0.5,
+    width = 0.75,
+  ) +
+  stat_summary(
+    fun.data = 'mean_cl_boot',
+    geom = 'errorbar',
+    position = position_dodge(width = 0.9),
+    width = 0,
+  ) +
+  scale_x_discrete(
+    labels = c(
+      'bot' = 'partner \nonly',
+      'participant' = 'participant \nonly',
+      'baseline' = 'cue \nintegration',
+      'early' = 'cue \nintegration \n(early trials)',
+      'late' = 'cue \nintegration \n(late trials)'
+    )
+  ) +
+  scale_y_continuous(
+    name = 'error (degrees)'
+  ) +
+  scale_color_manual(
+    name = element_blank(),
+    values = COLORS
+  ) +
+  scale_fill_manual(
+    name = element_blank(),
+    values = COLORS
+  ) +
+  PLOT_THEME
 
