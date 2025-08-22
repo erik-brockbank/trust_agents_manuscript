@@ -18,7 +18,7 @@ library(tidyverse)
 DATA_DIR = '../../data' # folder containing data files
 E1_DATA_FILE = 'experiment_1/physics_continual_learning_trialdata_e2_full.csv' # name of file containing full dataset
 NONSOCIAL_DATA_FILE = 'experiment_1_nonsocial/nonsocial_trialdata.csv' # name of file containing trial dataset for nonsocial control
-
+FIGURE_PATH = '../../results/model_figures' # output directory
 
 # Experiment parameters
 N_TRIALS = 96
@@ -226,7 +226,7 @@ nonsocial_data = nonsocial_data |>
 
 # MODEL ----
 
-DECAY_SLOPE = -1.0
+DECAY_SLOPE = -2.0
 
 # > Calculate variance of bot error ----
 
@@ -445,8 +445,10 @@ trial_data = trial_data |>
   )
 
 
+# FIGURE: model comparison ----
+
 # Figure: compare error across models
-trial_data |>
+model_comparison_fig = trial_data |>
   select(
     gameID, trialInd, trial_block, condition_str,
     weighted_paddle_estimate_error_degrees_bot,
@@ -485,6 +487,7 @@ trial_data |>
     geom = 'pointrange'
   ) +
   scale_x_discrete(
+    name = element_blank(),
     labels = c(
       'bot' = 'partner \nonly',
       'participant' = 'participant \nonly',
@@ -494,12 +497,26 @@ trial_data |>
     )
   ) +
   scale_y_continuous(
-    name = 'error (degrees)'
+    name = 'error (degrees)',
+    breaks = seq(10, 20, by = 2),
+    labels = seq(10, 20, by = 2),
+    # limits = c(10, 20)
   ) +
   PLOT_THEME
+# Save figure
+model_comparison_fig
+# ggsave(
+#   model_comparison_fig,
+#   filename = 'raw_model_comparison_summary.pdf',
+#   path = FIGURE_PATH,
+#   device = cairo_pdf,
+#   width = 12,
+#   height = 7,
+# )
+
 
 # Figure: compare error across models (separate by condition)
-trial_data |>
+model_comparison_condition_fig = trial_data |>
   select(
     gameID, trialInd, trial_block, condition_str,
     weighted_paddle_estimate_error_degrees_bot,
@@ -531,22 +548,37 @@ trial_data |>
     )
   ) |>
   ggplot(
-    aes(x = model, y = degrees, color = condition_str, fill = condition_str)
+    aes(x = model, y = degrees)
   ) +
   stat_summary(
+    aes(fill = condition_str),
+    color = 'black',
     fun.data = 'mean_cl_boot',
     geom = 'bar',
     position = position_dodge(width = 0.9),
-    alpha = 0.5,
+    alpha = 0.75,
     width = 0.75,
+    # show.legend = F
   ) +
   stat_summary(
+    # NB: aes throws a warning but we need this to align the errorbars without changing color
+    aes(fill = condition_str),
     fun.data = 'mean_cl_boot',
     geom = 'errorbar',
     position = position_dodge(width = 0.9),
     width = 0,
+    show.legend = F
+  ) +
+  stat_summary(
+    aes(x = model, y = degrees, color = 'average'),
+    fun.data = 'mean_cl_boot',
+    geom = 'pointrange',
+    size = 2,
+    # linewidth = 1,
+    show.legend = F
   ) +
   scale_x_discrete(
+    name = element_blank(),
     labels = c(
       'bot' = 'partner \nonly',
       'participant' = 'participant \nonly',
@@ -556,15 +588,35 @@ trial_data |>
     )
   ) +
   scale_y_continuous(
-    name = 'error (degrees)'
+    name = 'error (degrees)',
+    breaks = seq(0, 40, by = 10),
+    labels = seq(0, 40, by = 10),
   ) +
   scale_color_manual(
     name = element_blank(),
-    values = COLORS
+    values = append(COLORS, c('average' = 'black'))
   ) +
   scale_fill_manual(
     name = element_blank(),
     values = COLORS
   ) +
   PLOT_THEME
+
+# Save figure
+model_comparison_condition_fig
+ggsave(
+  # NB: save call removes legend
+  model_comparison_condition_fig + theme(legend.position = 'none'),
+  filename = 'raw_model_comparison_by_condition.pdf',
+  path = FIGURE_PATH,
+  device = cairo_pdf,
+  width = 12,
+  height = 8,
+)
+
+
+
+
+
+
 
